@@ -1,2 +1,159 @@
 # Sistema-de-caja
-POS SaaS multi-tenant: sistema de punto de venta en la nube donde varias empresas usan la misma plataforma, pero cada una mantiene sus propios productos, usuarios, cajas, ventas y facturas separados. En este proyecto se usa Django, MySQL, Celery, Redis y Siigo para facturación electrónica.
+
+# Prompt maestro — POS DIAN multi-tenant (Python/Django/MySQL/Siigo)
+
+> Usa este documento como contexto completo para retomar, extender o delegar
+> el desarrollo del proyecto. Resume TODAS las decisiones de arquitectura
+> tomadas hasta ahora.
+
+## 1. Qué estamos construyendo
+
+Un **sistema de punto de venta (POS) tipo SaaS multi-tenant**, donde cada
+negocio que se registra (una "Empresa") opera de forma completamente
+independiente: su propio catálogo de productos, sus propias cajas, sus
+propios usuarios y su propia facturación electrónica ante la DIAN
+(Colombia), todo sobre la misma instalación de software.
+
+- Cada tenant = una empresa real, con su propio NIT.
+- Un negocio puede tener **varias cajas físicas simultáneas** (varios
+  cajeros cobrando al mismo tiempo en distintos terminales).
+- La facturación electrónica se hace **siempre a través de Siigo** como
+  Proveedor Tecnológico (PT) autorizado por la DIAN — no se integra
+  directo con los servicios de la DIAN, y no se soporta ningún otro PT.
+  Cada empresa tiene su propia cuenta/credenciales de Siigo.
+
+## 2. Stack técnico
+
+| Capa | Tecnología | Notas |
+|---|---|---|
+| Backend | Python + Django | apps organizadas bajo `apps/` |
+| API | Django REST Framework | JWT (`simplejwt`) + sesiones |
+| Base de datos | MySQL 8 | shared schema multi-tenant (ver sección 4) |
+| Tareas asíncronas | Celery + Redis | envío a Siigo, reintentos, contingencia |
+| Facturación electrónica | **Siigo** (API REST) | única integración soportada |
+| Config por entorno | `django-environ` | `config/settings/{base,dev,prod}.py` |
+
+## 3. Por qué esta arquitectura (decisiones ya tomadas, no reabrir sin razón)
+
+1. **No se integra directo con la DIAN.** Implementar UBL 2.1, firma
+   digital XAdES y los servicios SOAP/REST de la DIAN es un proyecto de
+   mantenimiento normativo permanente que no se justifica para un POS.
+   Se delega 100% en Siigo.
+2. **Multi-tenant con shared schema (`empresa_id` en cada tabla)**, no
+   "una base de datos por cliente" ni "un schema por cliente" — esas dos
+   alternativas solo se justifican con exigencias de aislamiento físico o
+   escala que este proyecto no tiene.
+3. **El proveedor de facturación es fijo: Siigo.** No existe selector ni
+   abstracción para otros proveedores — se decidió explícitamente no
+   sobre-diseñar para un caso hipotético futuro.
+4. **La venta nunca espera la respuesta de Siigo/DIAN.** Se cierra la
+   venta en caja de inmediato; el envío de la factura ocurre en background
+   vía Celery, con reintentos y un estado `en_contingencia` si todo falla.
+5. **Nunca se borra una Empresa físicamente.** Solo `activa = False`
+   (soft delete) — las facturas electrónicas deben conservarse mínimo 5
+   años por ley, y un `DELETE` en cascada las destruiría.
+
+## 4. Modelo de datos (resumen — ver diccionario de datos completo aparte)
+
+Estrategia: **shared schema**, casi todas las tablas llevan `empresa_id`.
+
+```text
+Empresa (tenant: NIT, régimen, resolución DIAN, credenciales propias de Siigo)
+ ├── Usuario (empresa_id, rol: dueño/supervisor/cajero)
+ ├── Categoria (empresa_id)
+ ├── Producto (empresa_id, codigo)          UNIQUE(empresa_id, codigo)
+ ├── Cliente (empresa_id, numero_documento)  UNIQUE(empresa_id, numero_documento)
+ ├── Caja (empresa_id, nombre)               UNIQUE(empresa_id, nombre)
+ │    └── TurnoCaja (empresa_id, caja_id, cajero_id) — apertura/cierre/arqueo
+ │         └── Venta (empresa_id, turno_id, cliente_id)
+ │              ├── DetalleVenta (venta_id, producto_id)
+ │              └── Factura (empresa_id, venta_id) — CUFE, XML, PDF, QR, estado
+```
+
+Reglas de integridad clave:
+- Las unicidades de negocio (código de producto, documento de cliente,
+  nombre de caja) son **compuestas con `empresa_id`**, nunca globales.
+- `empresa_id` está **denormalizado a propósito** en `Usuario`,
+  `TurnoCaja`, `Venta` y `Factura` para que filtrar "todo lo de esta
+  empresa" sea un índice directo, no un JOIN de varios niveles.
+- Relaciones financieras (`Venta`, `Factura`, `DetalleVenta.producto`) usan
+  `ON DELETE PROTECT`: nunca se puede borrar en cascada algo con historial.
+
+## 5. Aislamiento multi-tenant a nivel de código
+
+- **`EmpresaQuerysetMixin`** (`apps/empresas/mixins.py`): todo `ViewSet`
+  de negocio hereda de aquí. Filtra automáticamente el `queryset` por
+  `request.user.empresa` y asigna `empresa` al crear — el cliente de la
+  API nunca puede mandar el `empresa_id` de otro tenant en el body.
+- Ningún desarrollador debe filtrar "a mano" por empresa en una vista
+  nueva: si hace falta un caso no cubierto por el mixin, se extiende el
+  mixin, no se repite el filtro suelto en cada vista.
+
+## 6. Flujo de venta → factura electrónica
+
+1. El cajero cierra la venta (`Venta` se crea) → **la caja da el ticket
+   de inmediato**, sin esperar nada externo.
+2. Una señal `post_save` crea el registro `Factura` en estado `pendiente`
+   y encola la tarea Celery `emitir_factura_electronica`.
+3. La tarea resuelve las credenciales de Siigo **de la Empresa dueña de
+   la venta** (`obtener_proveedor(empresa)`), arma el payload y llama a
+   la API de Siigo.
+4. Si Siigo/la DIAN responden: se guarda CUFE, número de factura, URLs de
+   PDF/XML y código QR; estado pasa a `aceptada` o `rechazada`.
+5. Si falla la comunicación: Celery reintenta con backoff exponencial
+   (`FACTURACION_MAX_REINTENTOS`, `FACTURACION_BACKOFF_BASE_SEGUNDOS`).
+   Si se agotan los intentos, la factura pasa a `en_contingencia` y una
+   tarea periódica (`reconsultar_facturas_en_contingencia`) la reintenta
+   sola más tarde.
+
+## 7. Roles de usuario
+
+| Rol | Alcance |
+|---|---|
+| `dueno` | Administra su propia Empresa completa: catálogo, cajas, usuarios, ve reportes |
+| `supervisor` | Gestiona catálogo y turnos, sin acceso a configuración de la empresa (credenciales Siigo, resolución DIAN) |
+| `cajero` | Solo abre/cierra su turno y registra ventas |
+
+*(los permisos DRF por rol todavía no están implementados — es un pendiente, ver sección 9)*
+
+## 8. Seguridad y cumplimiento — no negociable
+
+- **Credenciales de Siigo cifradas**: hoy son `CharField` plano en
+  `Empresa` para que el scaffold migre; antes de producción deben cifrarse
+  a nivel de aplicación (ej. `django-cryptography`) o vivir en un secret
+  manager con solo un identificador en la BD.
+- **Retención legal de 5 años** de las facturas electrónicas — es la
+  razón de que `Empresa`, `Venta` y `Factura` nunca se borren físicamente.
+- **Numeración DIAN por empresa**: el rango autorizado (`resolucion_*`)
+  se vincula a Siigo desde el portal de la DIAN, no desde este código —
+  el sistema solo debe alertar cuando el rango esté por agotarse o vencer.
+- **Régimen tributario por empresa** (`regimen_tributario`) determina si
+  esa empresa cobra IVA o no en sus ventas — no es un valor global del
+  sistema.
+
+## 9. Pendientes / decisiones abiertas (no asumir resueltas)
+
+- Permisos DRF concretos por rol (`dueno`/`supervisor`/`cajero`).
+- Onboarding de una empresa nueva: endpoint/flujo para registrar NIT,
+  resolución DIAN y credenciales de Siigo.
+- Validar el payload exacto de la API de Siigo (`/v1/invoices`, `/auth`)
+  contra la documentación vigente y una cuenta de pruebas — la forma del
+  adaptador está lista, pero los nombres de campo no están confirmados.
+- Notas crédito/débito, retenciones y documento soporte (compras a no
+  obligados a facturar) — el modelo actual solo cubre factura de venta.
+- Impresión del ticket/comprobante en la caja (formato térmico 58/80mm).
+- Histórico de cambios de precio en `Producto` (no existe todavía).
+- Si se necesita que un mismo usuario pertenezca a varias empresas, el
+  `Usuario.empresa` (FK simple) tendría que pasar a una tabla intermedia
+  `Membresia(usuario, empresa, rol)` — hoy se asume 1 usuario = 1 empresa.
+
+## 10. Cómo pedir cambios sobre este proyecto
+
+Si vas a pedir una extensión, indica explícitamente:
+- Si afecta el aislamiento multi-tenant (¿la tabla nueva necesita `empresa_id`?).
+- Si afecta el flujo de facturación (¿cambia el payload a Siigo o el
+  manejo de estados de `Factura`?).
+- Si es un pendiente de la sección 9 que ya sabíamos que faltaba, o un
+  requisito nuevo no contemplado — para no reabrir decisiones ya tomadas
+  sin que sea intencional (ej. volver a soportar Alegra, integrarse
+  directo con la DIAN, permitir borrado físico de una Empresa).
