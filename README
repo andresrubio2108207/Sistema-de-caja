@@ -1,0 +1,467 @@
+# Prompt maestro — POS DIAN multi-tenant (Python/Django/MySQL/Siigo)
+
+> Usa este documento como contexto completo para retomar, extender o delegar
+> el desarrollo del proyecto. Resume TODAS las decisiones de arquitectura
+> tomadas hasta ahora — pégalo al inicio de una nueva conversación o
+> entrégaselo a otro desarrollador para que no se pierda ningún acuerdo.
+
+## 1. Qué estamos construyendo
+
+Un **sistema de punto de venta (POS) tipo SaaS multi-tenant**, donde cada
+negocio que se registra (una "Empresa") opera de forma completamente
+independiente: su propio catálogo de productos, sus propias cajas, sus
+propios usuarios y su propia facturación electrónica ante la DIAN
+(Colombia), todo sobre la misma instalación de software.
+
+- Cada tenant = una empresa real, con su propio NIT.
+- Un negocio puede tener **varias cajas físicas simultáneas** (varios
+  cajeros cobrando al mismo tiempo en distintos terminales).
+- La facturación electrónica se hace **siempre a través de Siigo** como
+  Proveedor Tecnológico (PT) autorizado por la DIAN — no se integra
+  directo con los servicios de la DIAN, y no se soporta ningún otro PT.
+  Cada empresa tiene su propia cuenta/credenciales de Siigo.
+
+## 2. Stack técnico
+
+| Capa | Tecnología | Notas |
+|---|---|---|
+| Backend | Python + Django | apps organizadas bajo `apps/` |
+| API | Django REST Framework | JWT (`simplejwt`) + sesiones |
+| Base de datos | MySQL 8 | shared schema multi-tenant (ver sección 4) |
+| Tareas asíncronas | Celery + Redis | envío a Siigo, reintentos, contingencia |
+| Facturación electrónica | **Siigo** (API REST) | única integración soportada |
+| Config por entorno | `django-environ` | `config/settings/{base,dev,prod}.py` |
+
+## 3. Por qué esta arquitectura (decisiones ya tomadas, no reabrir sin razón)
+
+1. **No se integra directo con la DIAN.** Implementar UBL 2.1, firma
+   digital XAdES y los servicios SOAP/REST de la DIAN es un proyecto de
+   mantenimiento normativo permanente que no se justifica para un POS.
+   Se delega 100% en Siigo.
+2. **Multi-tenant con shared schema (`empresa_id` en cada tabla)**, no
+   "una base de datos por cliente" ni "un schema por cliente" — esas dos
+   alternativas solo se justifican con exigencias de aislamiento físico o
+   escala que este proyecto no tiene.
+3. **El proveedor de facturación es fijo: Siigo.** No existe selector ni
+   abstracción para otros proveedores — se decidió explícitamente no
+   sobre-diseñar para un caso hipotético futuro.
+4. **La venta nunca espera la respuesta de Siigo/DIAN.** Se cierra la
+   venta en caja de inmediato; el envío de la factura ocurre en background
+   vía Celery, con reintentos y un estado `en_contingencia` si todo falla.
+5. **Nunca se borra una Empresa físicamente.** Solo `activa = False`
+   (soft delete) — las facturas electrónicas deben conservarse mínimo 5
+   años por ley, y un `DELETE` en cascada las destruiría.
+
+## 4. Modelo de datos (resumen — ver diccionario de datos completo aparte)
+
+Estrategia: **shared schema**, casi todas las tablas llevan `empresa_id`.
+
+```
+Empresa (tenant: NIT, régimen, resolución DIAN, credenciales propias de Siigo)
+ ├── Usuario (empresa_id, rol: dueño/supervisor/cajero)
+ ├── Categoria (empresa_id)
+ ├── Producto (empresa_id, codigo)          UNIQUE(empresa_id, codigo)
+ ├── Cliente (empresa_id, numero_documento)  UNIQUE(empresa_id, numero_documento)
+ ├── Caja (empresa_id, nombre)               UNIQUE(empresa_id, nombre)
+ │    └── TurnoCaja (empresa_id, caja_id, cajero_id) — apertura/cierre/arqueo
+ │         └── Venta (empresa_id, turno_id, cliente_id)
+ │              ├── DetalleVenta (venta_id, producto_id)
+ │              └── Factura (empresa_id, venta_id) — CUFE, XML, PDF, QR, estado
+```
+
+Reglas de integridad clave:
+- Las unicidades de negocio (código de producto, documento de cliente,
+  nombre de caja) son **compuestas con `empresa_id`**, nunca globales.
+- `empresa_id` está **denormalizado a propósito** en `Usuario`,
+  `TurnoCaja`, `Venta` y `Factura` para que filtrar "todo lo de esta
+  empresa" sea un índice directo, no un JOIN de varios niveles.
+- Relaciones financieras (`Venta`, `Factura`, `DetalleVenta.producto`) usan
+  `ON DELETE PROTECT`: nunca se puede borrar en cascada algo con historial.
+
+## 5. Aislamiento multi-tenant a nivel de código
+
+- **`EmpresaQuerysetMixin`** (`apps/empresas/mixins.py`): todo `ViewSet`
+  de negocio hereda de aquí. Filtra automáticamente el `queryset` por
+  `request.user.empresa` y asigna `empresa` al crear — el cliente de la
+  API nunca puede mandar el `empresa_id` de otro tenant en el body.
+- Ningún desarrollador debe filtrar "a mano" por empresa en una vista
+  nueva: si hace falta un caso no cubierto por el mixin, se extiende el
+  mixin, no se repite el filtro suelto en cada vista.
+
+## 6. Flujo de venta → factura electrónica
+
+1. El cajero cierra la venta (`Venta` se crea) → **la caja da el ticket
+   de inmediato**, sin esperar nada externo.
+2. Una señal `post_save` crea el registro `Factura` en estado `pendiente`
+   y encola la tarea Celery `emitir_factura_electronica`.
+3. La tarea resuelve las credenciales de Siigo **de la Empresa dueña de
+   la venta** (`obtener_proveedor(empresa)`), arma el payload y llama a
+   la API de Siigo.
+4. Si Siigo/la DIAN responden: se guarda CUFE, número de factura, URLs de
+   PDF/XML y código QR; estado pasa a `aceptada` o `rechazada`.
+5. Si falla la comunicación: Celery reintenta con backoff exponencial
+   (`FACTURACION_MAX_REINTENTOS`, `FACTURACION_BACKOFF_BASE_SEGUNDOS`).
+   Si se agotan los intentos, la factura pasa a `en_contingencia` y una
+   tarea periódica (`reconsultar_facturas_en_contingencia`) la reintenta
+   sola más tarde.
+
+## 7. Roles de usuario
+
+| Rol | Alcance |
+|---|---|
+| `dueno` | Administra su propia Empresa completa: catálogo, cajas, usuarios, ve reportes |
+| `supervisor` | Gestiona catálogo y turnos, sin acceso a configuración de la empresa (credenciales Siigo, resolución DIAN) |
+| `cajero` | Solo abre/cierra su turno y registra ventas |
+
+*(los permisos DRF por rol todavía no están implementados — es un pendiente, ver sección 9)*
+
+## 8. Seguridad y cumplimiento — no negociable
+
+- **Credenciales de Siigo cifradas**: hoy son `CharField` plano en
+  `Empresa` para que el scaffold migre; antes de producción deben cifrarse
+  a nivel de aplicación (ej. `django-cryptography`) o vivir en un secret
+  manager con solo un identificador en la BD.
+- **Retención legal de 5 años** de las facturas electrónicas — es la
+  razón de que `Empresa`, `Venta` y `Factura` nunca se borren físicamente.
+- **Numeración DIAN por empresa**: el rango autorizado (`resolucion_*`)
+  se vincula a Siigo desde el portal de la DIAN, no desde este código —
+  el sistema solo debe alertar cuando el rango esté por agotarse o vencer.
+- **Régimen tributario por empresa** (`regimen_tributario`) determina si
+  esa empresa cobra IVA o no en sus ventas — no es un valor global del
+  sistema.
+
+## 9. Pendientes / decisiones abiertas (no asumir resueltas)
+
+- Permisos DRF concretos por rol (`dueno`/`supervisor`/`cajero`).
+- Onboarding de una empresa nueva: endpoint/flujo para registrar NIT,
+  resolución DIAN y credenciales de Siigo.
+- Validar el payload exacto de la API de Siigo (`/v1/invoices`, `/auth`)
+  contra la documentación vigente y una cuenta de pruebas — la forma del
+  adaptador está lista, pero los nombres de campo no están confirmados.
+- Notas crédito/débito, retenciones y documento soporte (compras a no
+  obligados a facturar) — el modelo actual solo cubre factura de venta.
+- Impresión del ticket/comprobante en la caja (formato térmico 58/80mm).
+- Histórico de cambios de precio en `Producto` (no existe todavía).
+- Si se necesita que un mismo usuario pertenezca a varias empresas, el
+  `Usuario.empresa` (FK simple) tendría que pasar a una tabla intermedia
+  `Membresia(usuario, empresa, rol)` — hoy se asume 1 usuario = 1 empresa.
+
+## 10. Cómo pedir cambios sobre este proyecto
+
+Si vas a pedir una extensión, indica explícitamente:
+- Si afecta el aislamiento multi-tenant (¿la tabla nueva necesita `empresa_id`?).
+- Si afecta el flujo de facturación (¿cambia el payload a Siigo o el
+  manejo de estados de `Factura`?).
+- Si es un pendiente de la sección 9 que ya sabíamos que faltaba, o un
+  requisito nuevo no contemplado — para no reabrir decisiones ya tomadas
+  sin que sea intencional (ej. volver a soportar Alegra, integrarse
+  directo con la DIAN, permitir borrado físico de una Empresa).
+
+  # Diseño de base de datos — POS DIAN (multi-tenant)
+
+Motor: **MySQL 8**. Estrategia de multi-tenancy: **shared schema con `empresa_id`** en cada tabla de negocio (una sola base de datos para todas las empresas, aislamiento aplicado por columna + constraints + capa de aplicación).
+
+## Diagrama entidad-relación
+
+```mermaid
+erDiagram
+    EMPRESA ||--o{ USUARIO : "emplea"
+    EMPRESA ||--o{ CATEGORIA : "define"
+    EMPRESA ||--o{ PRODUCTO : "cataloga"
+    EMPRESA ||--o{ CLIENTE : "administra"
+    EMPRESA ||--o{ CAJA : "posee"
+    EMPRESA ||--o{ TURNO_CAJA : "opera"
+    EMPRESA ||--o{ VENTA : "vende"
+    EMPRESA ||--o{ FACTURA : "factura"
+
+    CATEGORIA ||--o{ PRODUCTO : "clasifica"
+
+    CAJA ||--o{ TURNO_CAJA : "abre"
+    USUARIO ||--o{ TURNO_CAJA : "trabaja"
+    TURNO_CAJA ||--o{ VENTA : "registra"
+
+    USUARIO ||--o{ VENTA : "cobra"
+    CLIENTE ||--o{ VENTA : "compra"
+    VENTA ||--o{ DETALLE_VENTA : "contiene"
+    PRODUCTO ||--o{ DETALLE_VENTA : "se_vende_en"
+    VENTA ||--|| FACTURA : "genera"
+
+    EMPRESA {
+        bigint id PK
+        varchar razon_social
+        varchar nombre_comercial
+        varchar nit UK
+        char digito_verificacion
+        varchar regimen_tributario
+        varchar resolucion_prefijo
+        int resolucion_rango_desde
+        int resolucion_rango_hasta
+        date resolucion_vigencia_hasta
+        varchar siigo_api_username
+        varchar siigo_api_access_key
+        varchar siigo_partner_id
+        boolean activa
+        datetime creada_en
+    }
+
+    USUARIO {
+        bigint id PK
+        bigint empresa_id FK
+        varchar username UK
+        varchar password
+        varchar email
+        varchar rol
+        boolean is_active
+    }
+
+    CATEGORIA {
+        bigint id PK
+        bigint empresa_id FK
+        varchar nombre
+    }
+
+    PRODUCTO {
+        bigint id PK
+        bigint empresa_id FK
+        bigint categoria_id FK
+        varchar codigo
+        varchar nombre
+        decimal precio_venta
+        decimal porcentaje_iva
+        decimal stock_actual
+        boolean activo
+    }
+
+    CLIENTE {
+        bigint id PK
+        bigint empresa_id FK
+        varchar tipo_documento
+        varchar numero_documento
+        varchar nombre_completo
+        varchar email
+    }
+
+    CAJA {
+        bigint id PK
+        bigint empresa_id FK
+        varchar nombre
+        boolean activa
+    }
+
+    TURNO_CAJA {
+        bigint id PK
+        bigint empresa_id FK
+        bigint caja_id FK
+        bigint cajero_id FK
+        varchar estado
+        decimal saldo_inicial
+        decimal saldo_final_declarado
+        decimal saldo_final_calculado
+        datetime abierto_en
+        datetime cerrado_en
+    }
+
+    VENTA {
+        bigint id PK
+        bigint empresa_id FK
+        bigint turno_id FK
+        bigint cajero_id FK
+        bigint cliente_id FK
+        varchar medio_pago
+        boolean es_de_contado
+        decimal subtotal
+        decimal total_iva
+        decimal total
+        datetime creada_en
+    }
+
+    DETALLE_VENTA {
+        bigint id PK
+        bigint venta_id FK
+        bigint producto_id FK
+        decimal cantidad
+        decimal precio_unitario
+    }
+
+    FACTURA {
+        bigint id PK
+        bigint empresa_id FK
+        bigint venta_id FK
+        varchar estado
+        varchar cufe
+        varchar numero_factura
+        varchar url_pdf
+        varchar url_xml
+        text codigo_qr
+        json respuesta_proveedor
+        varchar proveedor_usado
+        datetime creada_en
+    }
+```
+
+## Diccionario de datos
+
+### `empresas_empresa` — el tenant
+
+| Campo | Tipo MySQL | Restricciones | Descripción |
+|---|---|---|---|
+| id | BIGINT | PK, AUTO_INCREMENT | |
+| razon_social | VARCHAR(255) | NOT NULL | Razón social ante la DIAN |
+| nombre_comercial | VARCHAR(255) | NULL | Nombre con el que opera de cara al cliente |
+| nit | VARCHAR(15) | NOT NULL, **UNIQUE** | Identifica el tenant fiscalmente |
+| digito_verificacion | CHAR(1) | NOT NULL | DV del NIT |
+| regimen_tributario | VARCHAR(25) | NOT NULL | `responsable_iva` / `no_responsable_iva` / `regimen_simple` |
+| direccion, ciudad, telefono | VARCHAR | NULL | |
+| email_facturacion | VARCHAR(254) | NULL | |
+| resolucion_prefijo | VARCHAR(10) | NULL | Prefijo autorizado por la DIAN (ej. `SETP`) |
+| resolucion_numero | VARCHAR(50) | NULL | Número de resolución de facturación |
+| resolucion_rango_desde / _hasta | INT UNSIGNED | NULL | Rango de numeración autorizado |
+| resolucion_vigencia_hasta | DATE | NULL | Fecha límite de la resolución |
+| siigo_api_username | VARCHAR(255) | NULL | Usuario de la cuenta de Siigo de ESTA empresa (cifrar antes de producción) |
+| siigo_api_access_key | VARCHAR(255) | NULL | Access key de Siigo de ESTA empresa (cifrar antes de producción) |
+| siigo_partner_id | VARCHAR(100) | NULL | Partner ID de Siigo |
+| activa | BOOLEAN | NOT NULL, default true | Soft-delete del tenant — nunca borrar físico |
+| creada_en | DATETIME(6) | NOT NULL, auto | |
+
+> El proveedor tecnológico es **siempre Siigo** — ya no hay campo selector.
+> Cada empresa guarda únicamente sus propias credenciales de Siigo.
+
+### `cuentas_usuario` — extiende el modelo de usuario de Django
+
+| Campo | Tipo MySQL | Restricciones | Descripción |
+|---|---|---|---|
+| id | BIGINT | PK | |
+| empresa_id | BIGINT | FK → empresas_empresa.id, **NULL** | NULL solo para superusuario de plataforma/soporte |
+| username, password, email, first_name, last_name | — | (estándar Django `AbstractUser`) | |
+| rol | VARCHAR(20) | NOT NULL, default `cajero` | `dueno` \| `supervisor` \| `cajero` |
+| is_active, is_staff, is_superuser | BOOLEAN | | |
+
+### `inventario_categoria`
+
+| Campo | Tipo MySQL | Restricciones |
+|---|---|---|
+| id | BIGINT | PK |
+| empresa_id | BIGINT | FK → empresa, NOT NULL |
+| nombre | VARCHAR(100) | NOT NULL |
+| | | **UNIQUE(empresa_id, nombre)** |
+
+### `inventario_producto`
+
+| Campo | Tipo MySQL | Restricciones | Descripción |
+|---|---|---|---|
+| id | BIGINT | PK | |
+| empresa_id | BIGINT | FK → empresa, NOT NULL | |
+| categoria_id | BIGINT | FK → categoria, NULL, `ON DELETE SET NULL` | |
+| codigo | VARCHAR(50) | NOT NULL | **UNIQUE(empresa_id, codigo)**, no globalmente único |
+| nombre | VARCHAR(200) | NOT NULL | |
+| precio_venta | DECIMAL(12,2) | NOT NULL | |
+| porcentaje_iva | DECIMAL(5,2) | NOT NULL, default 19.00 | |
+| stock_actual | DECIMAL(12,2) | NOT NULL, default 0 | |
+| activo | BOOLEAN | NOT NULL, default true | |
+| creado_en | DATETIME(6) | auto | |
+| | | **INDEX(empresa_id, activo)** | acelera el listado del catálogo activo en el POS |
+
+### `terceros_cliente`
+
+| Campo | Tipo MySQL | Restricciones |
+|---|---|---|
+| id | BIGINT | PK |
+| empresa_id | BIGINT | FK → empresa, NOT NULL |
+| tipo_documento | VARCHAR(5) | NOT NULL — `CC`/`NIT`/`CE`/`PAS` |
+| numero_documento | VARCHAR(20) | NOT NULL — **UNIQUE(empresa_id, numero_documento)** |
+| nombre_completo | VARCHAR(200) | NOT NULL |
+| email, telefono, direccion | VARCHAR | NULL |
+
+### `caja_caja`
+
+| Campo | Tipo MySQL | Restricciones |
+|---|---|---|
+| id | BIGINT | PK |
+| empresa_id | BIGINT | FK → empresa, NOT NULL |
+| nombre | VARCHAR(50) | NOT NULL — **UNIQUE(empresa_id, nombre)** |
+| activa | BOOLEAN | default true |
+
+### `caja_turnocaja` — apertura/cierre de caja (arqueo)
+
+| Campo | Tipo MySQL | Restricciones | Descripción |
+|---|---|---|---|
+| id | BIGINT | PK | |
+| empresa_id | BIGINT | FK → empresa, NOT NULL | denormalizado desde `caja` |
+| caja_id | BIGINT | FK → caja, `ON DELETE PROTECT` | |
+| cajero_id | BIGINT | FK → usuario, `ON DELETE PROTECT` | |
+| estado | VARCHAR(10) | NOT NULL — `abierto` \| `cerrado` | |
+| saldo_inicial | DECIMAL(12,2) | NOT NULL | |
+| saldo_final_declarado | DECIMAL(12,2) | NULL | lo que el cajero cuenta físicamente |
+| saldo_final_calculado | DECIMAL(12,2) | NULL | lo que el sistema calcula por las ventas |
+| abierto_en | DATETIME(6) | auto | |
+| cerrado_en | DATETIME(6) | NULL | |
+| | | **INDEX(empresa_id, estado)** | para ubicar rápido los turnos abiertos |
+
+### `ventas_venta`
+
+| Campo | Tipo MySQL | Restricciones | Descripción |
+|---|---|---|---|
+| id | BIGINT | PK | |
+| empresa_id | BIGINT | FK → empresa, `ON DELETE PROTECT` | denormalizado desde `turno → caja` |
+| turno_id | BIGINT | FK → turno_caja, `ON DELETE PROTECT` | |
+| cajero_id | BIGINT | FK → usuario, `ON DELETE PROTECT` | |
+| cliente_id | BIGINT | FK → cliente, NULL, `ON DELETE PROTECT` | NULL = consumidor final |
+| medio_pago | VARCHAR(20) | NOT NULL | `EFECTIVO`/`TARJETA`/`TRANSFERENCIA`/`MIXTO` |
+| es_de_contado | BOOLEAN | default true | |
+| subtotal, total_iva, total | DECIMAL(12,2) | NOT NULL, default 0 | |
+| creada_en | DATETIME(6) | auto | |
+| | | **INDEX(empresa_id, creada_en)** | reportes por rango de fechas |
+
+### `ventas_detalleventa`
+
+| Campo | Tipo MySQL | Restricciones |
+|---|---|---|
+| id | BIGINT | PK |
+| venta_id | BIGINT | FK → venta, `ON DELETE CASCADE` |
+| producto_id | BIGINT | FK → producto, `ON DELETE PROTECT` |
+| cantidad | DECIMAL(12,2) | NOT NULL |
+| precio_unitario | DECIMAL(12,2) | NOT NULL |
+
+*(no lleva `empresa_id` propio: se resuelve siempre vía `venta_id`)*
+
+### `facturacion_factura`
+
+| Campo | Tipo MySQL | Restricciones | Descripción |
+|---|---|---|---|
+| id | BIGINT | PK | |
+| empresa_id | BIGINT | FK → empresa, `ON DELETE PROTECT` | denormalizado desde `venta` |
+| venta_id | BIGINT | FK → venta, **UNIQUE**, `ON DELETE PROTECT` | 1 factura por venta |
+| estado | VARCHAR(20) | NOT NULL, default `pendiente` | `pendiente`/`aceptada`/`rechazada`/`en_contingencia`/`anulada` |
+| cufe | VARCHAR(200) | NULL | lo asigna la DIAN vía el PT |
+| numero_factura | VARCHAR(50) | NULL | |
+| url_pdf, url_xml | VARCHAR(200) | NULL | |
+| codigo_qr | LONGTEXT | NULL | |
+| motivo_rechazo | LONGTEXT | NULL | |
+| respuesta_proveedor | JSON | NULL | payload crudo del PT, para auditoría |
+| proveedor_usado | VARCHAR(20) | NULL | histórico: con cuál proveedor se facturó esta venta |
+| creada_en, actualizada_en | DATETIME(6) | auto | |
+
+## Reglas de integridad que sostienen el aislamiento multi-tenant
+
+1. **Toda unicidad de negocio es compuesta con `empresa_id`**: ningún campo que el usuario controle (código de producto, documento de cliente, nombre de caja) es único a nivel global — solo dentro de su empresa.
+2. **`empresa_id` está denormalizado** en `Usuario`, `TurnoCaja`, `Venta` y `Factura` aunque técnicamente se podría derivar por relación (`venta → turno → caja → empresa`). Es a propósito: cada filtro típico del sistema ("dame todo lo de esta empresa") queda como una condición indexada de una sola tabla, no un JOIN de 3–4 niveles.
+3. **`ON DELETE PROTECT`** en las relaciones financieras (`Venta`, `Factura`, `DetalleVenta.producto`) para que nunca se pueda borrar en cascada un producto o una caja que ya tiene ventas asociadas — se inactiva (`activo=False`), no se borra.
+4. **`Empresa.activa`** es el único mecanismo de "baja" de un tenant. Un `DELETE` físico de una empresa arrastraría en cascada usuarios, catálogo y turnos (`ON DELETE CASCADE`), pero **ventas y facturas están en `PROTECT`** precisamente para que sea imposible borrar en cascada un historial que la ley obliga a conservar 5 años.
+5. **El proveedor tecnológico es siempre Siigo** — no hay campo selector ni tabla de credenciales por proveedor. `Empresa` solo guarda sus propias `siigo_api_username` / `siigo_api_access_key` / `siigo_partner_id`.
+
+## Etapas de desarollo 
+
+Etapa	Qué resuelve
+0 Fundamentos (ya hecho: scaffold, modelo de datos, multi-tenant)
+1	Onboarding de empresas + login JWT + permisos por rol
+2	CRUD de catálogo (productos/categorías)
+3	Caja y ventas (turnos, arqueo, venta con detalle)
+4	Facturación real con Siigo (validar payload, probar contingencia)
+5	Notas crédito/débito y documento soporte
+6	Reportes (ventas, IVA)
+7	Interfaz de caja (frontend)
+8	Seguridad y hardening de producción
+9	Despliegue (Docker, CI/CD)
+
+
+
