@@ -2,7 +2,7 @@ from decimal import Decimal
 
 from rest_framework import serializers
 
-from .models import Categoria, MovimientoInventario, Producto
+from .models import Categoria, HistoricoPrecio, MovimientoInventario, Producto
 from .services import aplicar_movimiento
 
 
@@ -101,6 +101,36 @@ class ProductoSerializer(serializers.ModelSerializer):
             )
             producto.refresh_from_db()
         return producto
+
+    def update(self, instance, validated_data):
+        precio_anterior = instance.precio_venta
+        producto = super().update(instance, validated_data)
+        if producto.precio_venta != precio_anterior:
+            request = self.context.get("request")
+            HistoricoPrecio.objects.create(
+                producto=producto,
+                precio_anterior=precio_anterior,
+                precio_nuevo=producto.precio_venta,
+                usuario=getattr(request, "user", None),
+            )
+        return producto
+
+
+class HistoricoPrecioSerializer(serializers.ModelSerializer):
+    usuario_username = serializers.CharField(source="usuario.username", read_only=True, default=None)
+
+    class Meta:
+        model = HistoricoPrecio
+        fields = [
+            "id",
+            "producto",
+            "precio_anterior",
+            "precio_nuevo",
+            "usuario",
+            "usuario_username",
+            "creado_en",
+        ]
+        read_only_fields = fields
 
 
 class MovimientoInventarioSerializer(serializers.ModelSerializer):

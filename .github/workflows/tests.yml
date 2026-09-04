@@ -1,0 +1,70 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: sistema_caja
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -proot"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      # Entorno de CI. Ninguna de estas claves es real — no reutilizar en
+      # local/producción (esas viven en .env, que nunca se sube al repo).
+      DJANGO_SETTINGS_MODULE: config.settings.test
+      SECRET_KEY: ci-secret-key-solo-para-tests
+      DEBUG: "False"
+      ALLOWED_HOSTS: localhost,127.0.0.1
+      DB_NAME: sistema_caja
+      DB_USER: root
+      DB_PASSWORD: root
+      DB_HOST: 127.0.0.1
+      DB_PORT: 3306
+      CELERY_BROKER_URL: redis://localhost:6379/0
+      CELERY_RESULT_BACKEND: django-db
+      FIELD_ENCRYPTION_KEY: WdChBMlM9tndg4xZq0xsQoaoYU7y8UOFx2YFXHVRksc=
+      SIIGO_AUTH_URL: https://api.siigo.com/auth
+      SIIGO_API_BASE_URL: https://api.siigo.com
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Instalar libs del sistema para mysqlclient
+        run: sudo apt-get update && sudo apt-get install -y default-libmysqlclient-dev pkg-config
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Esperar a que MySQL responda
+        run: |
+          for i in $(seq 1 30); do
+            mysqladmin ping -h127.0.0.1 -uroot -proot --silent && exit 0
+            sleep 2
+          done
+          echo "MySQL no respondió a tiempo" && exit 1
+
+      - name: Verificar que no falten migraciones
+        run: python manage.py makemigrations --check --dry-run
+
+      - name: Correr la suite de tests
+        run: python manage.py test --settings=config.settings.test --verbosity=2

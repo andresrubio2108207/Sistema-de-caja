@@ -34,6 +34,7 @@ INSTALLED_APPS = [
     # Terceros
     "rest_framework",
     "rest_framework_simplejwt.token_blacklist",
+    "drf_spectacular",
     "corsheaders",
     "django_celery_results",
     "django_celery_beat",
@@ -138,6 +139,18 @@ REST_FRAMEWORK = {
     ),
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 50,
+    # Sin throttle global: se aplica por vista (ver onboarding/login) donde
+    # el costo de un abuso es alto (fuerza bruta, alta masiva de tenants).
+    "DEFAULT_THROTTLE_CLASSES": [],
+    "DEFAULT_THROTTLE_RATES": {
+        "onboarding": "5/hour",
+        # Ojo: para el login el throttle es por IP (aún no hay usuario
+        # autenticado). Varios cajeros de la MISMA tienda comparten IP
+        # pública, así que el límite debe tolerar un cambio de turno con
+        # varias terminales entrando casi a la vez, no solo un usuario.
+        "login": "20/min",
+    },
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
 }
 
 SIMPLE_JWT = {
@@ -145,6 +158,21 @@ SIMPLE_JWT = {
     "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
     "ROTATE_REFRESH_TOKENS": True,
     "BLACKLIST_AFTER_ROTATION": True,
+}
+
+SPECTACULAR_SETTINGS = {
+    "TITLE": "POS DIAN API",
+    "DESCRIPTION": (
+        "API del POS multi-tenant. Todo endpoint de negocio requiere JWT "
+        "(Authorization: Bearer <access>) salvo /api/onboarding/ y "
+        "/api/auth/token/."
+    ),
+    "VERSION": "1.0.0",
+    "SERVE_INCLUDE_SCHEMA": False,
+    # Los ViewSets acotan el queryset por empresa en tiempo de request
+    # (EmpresaQuerysetMixin); en el arranque (sin request) no hay empresa,
+    # así que el esquema se genera igual mostrando el queryset "base".
+    "COMPONENT_SPLIT_REQUEST": True,
 }
 
 # --------------------------------------------------------------------------- #
@@ -170,3 +198,8 @@ FACTURACION_BACKOFF_BASE_SEGUNDOS = env.int(
 # --------------------------------------------------------------------------- #
 SIIGO_AUTH_URL = env("SIIGO_AUTH_URL", default="https://api.siigo.com/auth")
 SIIGO_API_BASE_URL = env("SIIGO_API_BASE_URL", default="https://api.siigo.com")
+
+# --------------------------------------------------------------------------- #
+# Cifrado de campos en reposo (credenciales Siigo) — apps.empresas.fields
+# --------------------------------------------------------------------------- #
+FIELD_ENCRYPTION_KEY = env("FIELD_ENCRYPTION_KEY")

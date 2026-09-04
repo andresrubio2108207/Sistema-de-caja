@@ -1,10 +1,15 @@
 from django.contrib import admin
 
-from .models import DetalleVenta, Venta
+from .models import DetalleVenta, PagoVenta, Venta
 
 
 class DetalleVentaInline(admin.TabularInline):
     model = DetalleVenta
+    extra = 0
+
+
+class PagoVentaInline(admin.TabularInline):
+    model = PagoVenta
     extra = 0
 
 
@@ -22,4 +27,4 @@ class VentaAdmin(admin.ModelAdmin):
     )
     list_filter = ("empresa", "medio_pago", "es_de_contado")
     date_hierarchy = "creada_en"
-    inlines = [DetalleVentaInline]
+    inlines = [DetalleVentaInline, PagoVentaInline]

@@ -1,29 +1,26 @@
 from django.db.models import ProtectedError
-from rest_framework import filters, mixins, status, viewsets
-from rest_framework.exceptions import APIException
+from rest_framework import filters, mixins, viewsets
+from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
 
 from apps.cuentas.permissions import (
     GestionCatalogo,
     GestionInventario,
     TieneEmpresaActiva,
 )
+from apps.empresas.exceptions import RecursoProtegido
 from apps.empresas.mixins import EmpresaQuerysetMixin
 
-from .models import Categoria, MovimientoInventario, Producto
+from .models import Categoria, HistoricoPrecio, MovimientoInventario, Producto
 from .serializers import (
     CategoriaSerializer,
+    HistoricoPrecioSerializer,
     MovimientoInventarioSerializer,
     ProductoSerializer,
 )
 
 CATALOGO_PERMISSIONS = [IsAuthenticated, TieneEmpresaActiva, GestionCatalogo]
-
-
-class RecursoProtegido(APIException):
-    status_code = status.HTTP_409_CONFLICT
-    default_detail = "El recurso tiene registros dependientes y no se puede eliminar."
-    default_code = "protegido"
 
 
 class CategoriaViewSet(EmpresaQuerysetMixin, viewsets.ModelViewSet):
@@ -84,6 +81,14 @@ class ProductoViewSet(EmpresaQuerysetMixin, viewsets.ModelViewSet):
                 "movimientos de inventario asociados. Desactívalo "
                 "(activo=false) en su lugar."
             )
+
+    @action(detail=True, methods=["get"], url_path="historico-precios")
+    def historico_precios(self, request, pk=None):
+        """Cada cambio de ``precio_venta`` de este producto: quién, cuándo,
+        de cuánto a cuánto. Se genera solo (ver ProductoSerializer.update)."""
+        producto = self.get_object()
+        historico = producto.historico_precios.select_related("usuario").all()
+        return Response(HistoricoPrecioSerializer(historico, many=True).data)
 
 
 class MovimientoInventarioViewSet(

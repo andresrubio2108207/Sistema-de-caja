@@ -212,6 +212,28 @@ class CatalogoTests(APITestCase):
         self.assertEqual(mov.stock_resultante, Decimal("25.00"))
         self.assertEqual(mov.motivo, "Stock inicial")
 
+    def test_cambiar_precio_genera_historico(self):
+        pk = self.crear_producto(self.users_a[Usuario.Rol.DUENO]).data["id"]
+        self.client.patch(
+            reverse("producto-detail", args=[pk]), {"precio_venta": "4200.00"}, format="json"
+        )
+        resp = self.client.get(reverse("producto-historico-precios", args=[pk]))
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(resp.data), 1)
+        self.assertEqual(resp.data[0]["precio_anterior"], "3500.00")
+        self.assertEqual(resp.data[0]["precio_nuevo"], "4200.00")
+        self.assertEqual(
+            resp.data[0]["usuario_username"], self.users_a[Usuario.Rol.DUENO].username
+        )
+
+    def test_no_cambiar_precio_no_genera_historico(self):
+        pk = self.crear_producto(self.users_a[Usuario.Rol.DUENO]).data["id"]
+        self.client.patch(
+            reverse("producto-detail", args=[pk]), {"nombre": "Otro nombre"}, format="json"
+        )
+        resp = self.client.get(reverse("producto-historico-precios", args=[pk]))
+        self.assertEqual(resp.data, [])
+
 
 class MovimientosInventarioTests(APITestCase):
     def setUp(self):

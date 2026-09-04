@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import Categoria, MovimientoInventario, Producto
+from .models import Categoria, HistoricoPrecio, MovimientoInventario, Producto
 
 
 @admin.register(Categoria)
@@ -40,6 +40,23 @@ class MovimientoInventarioAdmin(admin.ModelAdmin):
     search_fields = ("producto__codigo", "producto__nombre", "motivo")
     date_hierarchy = "creado_en"
     readonly_fields = [f.name for f in MovimientoInventario._meta.fields]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(HistoricoPrecio)
+class HistoricoPrecioAdmin(admin.ModelAdmin):
+    list_display = ("creado_en", "producto", "precio_anterior", "precio_nuevo", "usuario")
+    search_fields = ("producto__codigo", "producto__nombre")
+    date_hierarchy = "creado_en"
+    readonly_fields = [f.name for f in HistoricoPrecio._meta.fields]
 
     def has_add_permission(self, request):
         return False

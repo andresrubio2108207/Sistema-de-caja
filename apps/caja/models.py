@@ -1,4 +1,7 @@
+from decimal import Decimal
+
 from django.conf import settings
+from django.core.validators import MinValueValidator
 from django.db import models
 
 
@@ -49,13 +52,24 @@ class TurnoCaja(models.Model):
     estado = models.CharField(
         max_length=10, choices=Estado.choices, default=Estado.ABIERTO
     )
-    saldo_inicial = models.DecimalField(max_digits=12, decimal_places=2)
+    saldo_inicial = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        validators=[MinValueValidator(Decimal("0"))],
+    )
     saldo_final_declarado = models.DecimalField(
-        max_digits=12, decimal_places=2, null=True, blank=True,
+        max_digits=12,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal("0"))],
         help_text="Lo que el cajero cuenta físicamente al cerrar.",
     )
     saldo_final_calculado = models.DecimalField(
-        max_digits=12, decimal_places=2, null=True, blank=True,
+        max_digits=12,
+        decimal_places=2,
+        null=True,
+        blank=True,
         help_text="Lo que el sistema calcula a partir de las ventas del turno.",
     )
     abierto_en = models.DateTimeField(auto_now_add=True)

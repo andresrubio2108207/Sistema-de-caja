@@ -1,4 +1,5 @@
 from django.contrib.auth.password_validation import validate_password
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 from rest_framework_simplejwt.serializers import (
     TokenObtainPairSerializer as BaseTokenObtainPairSerializer,
@@ -33,6 +34,7 @@ class MeSerializer(serializers.ModelSerializer):
             "empresa",
         ]
 
+    @extend_schema_field(EmpresaResumenSerializer(allow_null=True))
     def get_empresa(self, obj):
         if obj.empresa_id is None:
             return None
@@ -58,6 +60,21 @@ class CustomTokenObtainPairSerializer(BaseTokenObtainPairSerializer):
             )
         data["usuario"] = MeSerializer(self.user).data
         return data
+
+
+class CambiarPasswordSerializer(serializers.Serializer):
+    """Para que un usuario cambie SU PROPIA contraseña (no la de otro)."""
+
+    password_actual = serializers.CharField(write_only=True, style={"input_type": "password"})
+    password_nueva = serializers.CharField(
+        write_only=True, validators=[validate_password], style={"input_type": "password"}
+    )
+
+    def validate_password_actual(self, value):
+        usuario = self.context["request"].user
+        if not usuario.check_password(value):
+            raise serializers.ValidationError("La contraseña actual no es correcta.")
+        return value
 
 
 class UsuarioSerializer(serializers.ModelSerializer):

@@ -456,7 +456,7 @@ Etapa	Qué resuelve
 1	Onboarding de empresas + login JWT + permisos por rol
 2	CRUD de catálogo (productos/categorías)
 3	Caja y ventas (turnos, arqueo, venta con detalle)
-4	Facturación real con Siigo (validar payload, probar contingencia)
+4	Facturación real (en espera) (validar payload, probar contingencia)
 5	Notas crédito/débito y documento soporte
 6	Reportes (ventas, IVA)
 7	Interfaz de caja (frontend)

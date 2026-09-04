@@ -1,4 +1,9 @@
+from datetime import date
+
+from django.core.validators import MaxLengthValidator
 from django.db import models
+
+from .fields import EncryptedTextField
 
 
 class Empresa(models.Model):
@@ -32,12 +37,18 @@ class Empresa(models.Model):
     resolucion_rango_hasta = models.PositiveIntegerField(null=True, blank=True)
     resolucion_vigencia_hasta = models.DateField(null=True, blank=True)
 
-    # Credenciales de Siigo propias de ESTA empresa.
-    # TODO(seguridad): cifrar a nivel de aplicación o mover a un secret manager
-    # antes de producción (ver sección 8 del prompt maestro).
-    siigo_api_username = models.CharField(max_length=255, blank=True)
-    siigo_api_access_key = models.CharField(max_length=255, blank=True)
-    siigo_partner_id = models.CharField(max_length=100, blank=True)
+    # Credenciales de Siigo propias de ESTA empresa. Cifradas en reposo
+    # (Fernet, ver apps.empresas.fields.EncryptedTextField) — nunca en texto
+    # plano en la base de datos.
+    siigo_api_username = EncryptedTextField(
+        blank=True, validators=[MaxLengthValidator(255)]
+    )
+    siigo_api_access_key = EncryptedTextField(
+        blank=True, validators=[MaxLengthValidator(255)]
+    )
+    siigo_partner_id = EncryptedTextField(
+        blank=True, validators=[MaxLengthValidator(100)]
+    )
 
     activa = models.BooleanField(default=True)
     creada_en = models.DateTimeField(auto_now_add=True)
@@ -49,3 +60,18 @@ class Empresa(models.Model):
 
     def __str__(self):
         return f"{self.razon_social} ({self.nit})"
+
+    # --- Alertas de resolución DIAN (sección 8 del prompt maestro) ---
+    # El rango de numeración se agota según facturas EMITIDAS; eso solo se
+    # puede calcular cuando exista el módulo de facturación (diferido). Por
+    # ahora la única alerta posible con los datos que hay es la de vigencia.
+    DIAS_ALERTA_VIGENCIA_RESOLUCION = 30
+
+    def dias_para_vencer_resolucion(self):
+        if not self.resolucion_vigencia_hasta:
+            return None
+        return (self.resolucion_vigencia_hasta - date.today()).days
+
+    def resolucion_por_vencer(self):
+        dias = self.dias_para_vencer_resolucion()
+        return dias is not None and dias <= self.DIAS_ALERTA_VIGENCIA_RESOLUCION
