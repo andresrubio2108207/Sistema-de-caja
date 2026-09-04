@@ -34,6 +34,10 @@ class Venta(models.Model):
         TRANSFERENCIA = "TRANSFERENCIA", "Transferencia"
         MIXTO = "MIXTO", "Mixto (dos o más medios)"
 
+    class Estado(models.TextChoices):
+        COMPLETADA = "completada", "Completada"
+        ANULADA = "anulada", "Anulada"
+
     empresa = models.ForeignKey(
         "empresas.Empresa", on_delete=models.PROTECT, related_name="ventas"
     )
@@ -51,10 +55,6 @@ class Venta(models.Model):
         related_name="ventas",
         help_text="NULL = consumidor final.",
     )
-    class Estado(models.TextChoices):
-        COMPLETADA = "completada", "Completada"
-        ANULADA = "anulada", "Anulada"
-
     medio_pago = models.CharField(max_length=20, choices=MedioPago.choices)
     es_de_contado = models.BooleanField(default=True)
     estado = models.CharField(
@@ -104,6 +104,16 @@ class DetalleVenta(models.Model):
         decimal_places=2,
         validators=[MinValueValidator(Decimal("0"))],
     )
+    porcentaje_iva = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=Decimal("19.00"),
+        help_text=(
+            "Foto del %IVA del producto al momento de la venta. Necesaria "
+            "para reportes de IVA correctos: si el IVA del producto cambia "
+            "después, esta línea no debe verse afectada."
+        ),
+    )
 
     class Meta:
         verbose_name = "detalle de venta"
@@ -138,3 +148,74 @@ class PagoVenta(models.Model):
 
     def __str__(self):
         return f"{self.medio_pago} {self.monto} (venta {self.venta_id})"
+
+
+class NotaCredito(models.Model):
+    """Devolución total o parcial de una venta YA COMPLETADA, en cualquier
+    momento (no depende de que el turno siga abierto — para eso está
+    ``Venta.anular``, que revierte TODO y solo funciona en el mismo turno).
+
+    Devuelve stock (kardex ``devolucion``) por las cantidades indicadas en
+    sus líneas y registra el ajuste monetario. **No** genera ningún
+    documento DIAN — eso es responsabilidad del módulo de facturación
+    (diferido); esto es la contabilidad interna del POS.
+    """
+
+    empresa = models.ForeignKey(
+        "empresas.Empresa", on_delete=models.PROTECT, related_name="notas_credito"
+    )
+    venta = models.ForeignKey(
+        "ventas.Venta", on_delete=models.PROTECT, related_name="notas_credito"
+    )
+    usuario = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="notas_credito",
+    )
+    motivo = models.CharField(max_length=255, blank=True)
+    subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0"))
+    total_iva = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0"))
+    total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0"))
+    creada_en = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "nota crédito"
+        verbose_name_plural = "notas crédito"
+        ordering = ["-creada_en"]
+        indexes = [
+            models.Index(
+                fields=["empresa", "creada_en"], name="ix_notacred_empresa_creada"
+            ),
+        ]
+
+    def __str__(self):
+        return f"NC venta #{self.venta_id} — {self.total}"
+
+
+class LineaNotaCredito(models.Model):
+    """No lleva ``empresa`` propia: se resuelve vía ``nota_credito``."""
+
+    nota_credito = models.ForeignKey(
+        "ventas.NotaCredito", on_delete=models.CASCADE, related_name="lineas"
+    )
+    detalle_venta = models.ForeignKey(
+        "ventas.DetalleVenta",
+        on_delete=models.PROTECT,
+        related_name="devoluciones",
+        help_text="La línea original de la venta que se está devolviendo.",
+    )
+    cantidad = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        validators=[MinValueValidator(Decimal("0.01"))],
+        help_text="Cuánto de esa línea se devuelve (puede ser parcial).",
+    )
+
+    class Meta:
+        verbose_name = "línea de nota crédito"
+        verbose_name_plural = "líneas de nota crédito"
+
+    def __str__(self):
+        return f"{self.cantidad} de detalle {self.detalle_venta_id}"

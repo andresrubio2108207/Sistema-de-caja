@@ -20,6 +20,7 @@ from apps.inventario.models import Categoria, MovimientoInventario, Producto
 from apps.inventario.services import aplicar_movimiento
 from apps.terceros.models import Cliente
 from apps.ventas.models import DetalleVenta, Venta
+from apps.ventas.services import emitir_nota_credito
 
 from .models import Empresa
 
@@ -80,8 +81,18 @@ class SeguridadMultiempresaTests(APITestCase):
             cajero=self.users_a[Usuario.Rol.CAJERO],
             medio_pago=Venta.MedioPago.EFECTIVO,
         )
-        DetalleVenta.objects.create(
-            venta=self.venta, producto=self.producto, cantidad=Decimal("1"), precio_unitario=Decimal("1000")
+        self.detalle_venta = DetalleVenta.objects.create(
+            venta=self.venta,
+            producto=self.producto,
+            cantidad=Decimal("2"),
+            precio_unitario=Decimal("1000"),
+            porcentaje_iva=Decimal("0"),
+        )
+        self.nota_credito = emitir_nota_credito(
+            venta=self.venta,
+            usuario=self.users_a[Usuario.Rol.DUENO],
+            motivo="prueba",
+            lineas=[{"detalle_venta": self.detalle_venta, "cantidad": Decimal("1")}],
         )
         self.usuario_objetivo = self.users_a[Usuario.Rol.CAJERO]
 
@@ -106,6 +117,7 @@ class SeguridadMultiempresaTests(APITestCase):
             ("caja-detail", self.caja.pk, True, True),
             ("turno-detail", self.turno.pk, False, False),
             ("venta-detail", self.venta.pk, False, False),
+            ("nota-credito-detail", self.nota_credito.pk, False, False),
             ("usuario-detail", self.usuario_objetivo.pk, True, True),
         ]
         for nombre_url, pk, admite_patch, admite_delete in casos:
@@ -161,6 +173,7 @@ class SeguridadMultiempresaTests(APITestCase):
             ("caja-list", self.caja.pk),
             ("turno-list", self.turno.pk),
             ("venta-list", self.venta.pk),
+            ("nota-credito-list", self.nota_credito.pk),
             ("usuario-list", self.usuario_objetivo.pk),
         ]
         for nombre_url, id_de_a in casos:

@@ -5,22 +5,36 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from apps.cuentas.models import Usuario
-from apps.cuentas.permissions import OperacionCaja, TieneEmpresaActiva, VerReportes
+from apps.cuentas.permissions import (
+    GestionNotasCredito,
+    OperacionCaja,
+    TieneEmpresaActiva,
+    VerReportes,
+)
 from apps.empresas.mixins import EmpresaQuerysetMixin
 
-from .models import Venta
-from .serializers import AnularVentaSerializer, TicketSerializer, VentaSerializer
+from .models import NotaCredito, Venta
+from .serializers import (
+    AnularVentaSerializer,
+    NotaCreditoSerializer,
+    TicketSerializer,
+    VentaSerializer,
+)
 from .services import (
     AnulacionNoPermitida,
+    NotaCreditoInvalida,
     PagoInvalido,
     ProductoInvalido,
     TurnoNoAbierto,
     VentaYaAnulada,
     anular_venta,
+    emitir_nota_credito,
     productos_mas_vendidos,
     registrar_venta,
+    reporte_iva,
     resumen_de_ventas,
     ventas_por_cajero,
+    ventas_por_dia,
 )
 
 
@@ -171,3 +185,82 @@ class VentaViewSet(
                 "cajeros": ventas_por_cajero(qs),
             }
         )
+
+    @action(detail=False, methods=["get"], url_path="por-dia")
+    def por_dia(self, request):
+        """Serie diaria de ventas. ``?desde=``/``?hasta=`` filtran el rango."""
+        qs = self.filter_queryset(self.get_queryset())
+        return Response(
+            {
+                "desde": request.query_params.get("desde"),
+                "hasta": request.query_params.get("hasta"),
+                "dias": ventas_por_dia(qs),
+            }
+        )
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="reporte-iva",
+        url_name="reporte-iva",
+        permission_classes=[IsAuthenticated, TieneEmpresaActiva, VerReportes],
+    )
+    def reporte_iva_view(self, request):
+        """IVA bruto vendido, lo devuelto por notas crédito y el neto del
+        periodo, desglosado por tarifa. ``?desde=``/``?hasta=`` filtran el
+        rango (por fecha de cada documento, no de la venta original)."""
+        reporte = reporte_iva(
+            empresa=request.user.empresa,
+            desde=request.query_params.get("desde"),
+            hasta=request.query_params.get("hasta"),
+        )
+        return Response(
+            {
+                "desde": request.query_params.get("desde"),
+                "hasta": request.query_params.get("hasta"),
+                **reporte,
+            }
+        )
+
+
+class NotaCreditoViewSet(
+    EmpresaQuerysetMixin,
+    mixins.CreateModelMixin,
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    viewsets.GenericViewSet,
+):
+    """Devoluciones (nota crédito), totales o parciales, de una venta
+    completada — funciona con el turno abierto o cerrado (a diferencia de
+    ``Venta.anular``, que solo funciona en el mismo turno). Solo alta y
+    consulta: inmutable. Dueño y supervisor únicamente.
+
+    Filtros: ``?venta=<id>``.
+    """
+
+    queryset = NotaCredito.objects.select_related("venta", "usuario").prefetch_related(
+        "lineas__detalle_venta__producto"
+    )
+    serializer_class = NotaCreditoSerializer
+    permission_classes = [IsAuthenticated, TieneEmpresaActiva, GestionNotasCredito]
+    filter_backends = [filters.OrderingFilter]
+    ordering = ["-creada_en"]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        if venta := self.request.query_params.get("venta"):
+            qs = qs.filter(venta_id=venta)
+        return qs
+
+    def perform_create(self, serializer):
+        data = serializer.validated_data
+        try:
+            nota = emitir_nota_credito(
+                venta=data["venta"],
+                usuario=self.request.user,
+                motivo=data.get("motivo", ""),
+                lineas=data["lineas"],
+            )
+        except NotaCreditoInvalida as exc:
+            raise ValidationError(str(exc))
+        serializer.instance = nota

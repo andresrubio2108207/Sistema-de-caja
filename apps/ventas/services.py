@@ -17,14 +17,15 @@ hay un solo pago, o ``MIXTO`` si hay dos o más.
 from decimal import ROUND_HALF_UP, Decimal
 
 from django.db import transaction
-from django.db.models import Count, F, Sum
+from django.db.models import Count, DecimalField, ExpressionWrapper, F, Sum
+from django.db.models.functions import TruncDate
 from django.utils import timezone
 
 from apps.caja.models import TurnoCaja
 from apps.inventario.models import MovimientoInventario, Producto
 from apps.inventario.services import aplicar_movimiento
 
-from .models import DetalleVenta, PagoVenta, Venta
+from .models import DetalleVenta, LineaNotaCredito, NotaCredito, PagoVenta, Venta
 
 DOS_DECIMALES = Decimal("0.01")
 
@@ -48,8 +49,13 @@ class VentaYaAnulada(Exception):
 
 class AnulacionNoPermitida(Exception):
     """El turno de la venta ya cerró: anular a esta altura descuadraría un
-    arqueo ya hecho. Eso se resuelve con nota crédito cuando exista
-    facturación, no con esta anulación simple."""
+    arqueo ya hecho. Para eso está la nota crédito (parcial o total, sin
+    importar si el turno sigue abierto)."""
+
+
+class NotaCreditoInvalida(Exception):
+    """La nota crédito no se puede emitir tal cual viene (venta anulada,
+    línea ajena, cantidad mayor a la disponible, etc.)."""
 
 
 def _dividir_iva(total_linea: Decimal, porcentaje_iva: Decimal) -> tuple[Decimal, Decimal]:
@@ -119,6 +125,7 @@ def registrar_venta(*, empresa, cajero, cliente, es_de_contado, lineas, pagos):
             producto=producto,
             cantidad=cantidad,
             precio_unitario=precio_unitario,
+            porcentaje_iva=producto.porcentaje_iva,
         )
 
         if producto.controla_stock:
@@ -192,6 +199,89 @@ def anular_venta(*, venta, usuario, motivo=""):
     return venta
 
 
+@transaction.atomic
+def emitir_nota_credito(*, venta, usuario, motivo, lineas):
+    """``lineas``: [{"detalle_venta": DetalleVenta, "cantidad": Decimal}, ...]
+
+    Devuelve stock por las cantidades indicadas (nunca más de lo que
+    quedaba disponible en esa línea, contando notas crédito previas) y dos
+    o más notas crédito parciales de la misma venta se van acumulando
+    correctamente."""
+    if not lineas:
+        raise NotaCreditoInvalida("La nota crédito debe tener al menos una línea.")
+
+    venta = Venta.objects.select_for_update().get(pk=venta.pk)
+    if venta.estado == Venta.Estado.ANULADA:
+        raise NotaCreditoInvalida("No se puede hacer nota crédito de una venta anulada.")
+
+    for linea in lineas:
+        if linea["detalle_venta"].venta_id != venta.pk:
+            raise NotaCreditoInvalida(
+                f"La línea {linea['detalle_venta'].pk} no pertenece a esta venta."
+            )
+
+    # Mismo orden determinístico que registrar_venta: evita interbloqueos
+    # con otras operaciones que también tocan estos productos.
+    ids_producto = sorted({l["detalle_venta"].producto_id for l in lineas})
+    productos = {
+        p.pk: p
+        for p in Producto.objects.select_for_update().filter(pk__in=ids_producto).order_by("pk")
+    }
+
+    nota = NotaCredito.objects.create(
+        empresa=venta.empresa, venta=venta, usuario=usuario, motivo=motivo
+    )
+
+    subtotal = Decimal("0")
+    total_iva = Decimal("0")
+    total = Decimal("0")
+
+    for linea in lineas:
+        detalle = linea["detalle_venta"]
+        cantidad = linea["cantidad"]
+
+        ya_devuelta = (
+            LineaNotaCredito.objects.filter(detalle_venta=detalle).aggregate(t=Sum("cantidad"))["t"]
+            or Decimal("0")
+        )
+        disponible = detalle.cantidad - ya_devuelta
+        if cantidad > disponible:
+            raise NotaCreditoInvalida(
+                f"La línea {detalle.pk} solo tiene {disponible} disponible para "
+                f"devolver (de {detalle.cantidad}, ya devuelto {ya_devuelta})."
+            )
+
+        LineaNotaCredito.objects.create(
+            nota_credito=nota, detalle_venta=detalle, cantidad=cantidad
+        )
+
+        total_linea = (cantidad * detalle.precio_unitario).quantize(
+            DOS_DECIMALES, rounding=ROUND_HALF_UP
+        )
+        base_linea, iva_linea = _dividir_iva(total_linea, detalle.porcentaje_iva)
+
+        producto = productos[detalle.producto_id]
+        if producto.controla_stock:
+            aplicar_movimiento(
+                producto=producto,
+                tipo=MovimientoInventario.Tipo.DEVOLUCION,
+                cantidad=cantidad,
+                venta=venta,
+                usuario=usuario,
+                motivo=f"Nota crédito venta #{venta.pk}" + (f": {motivo}" if motivo else ""),
+            )
+
+        subtotal += base_linea
+        total_iva += iva_linea
+        total += total_linea
+
+    nota.subtotal = subtotal
+    nota.total_iva = total_iva
+    nota.total = total
+    nota.save(update_fields=["subtotal", "total_iva", "total"])
+    return nota
+
+
 def resumen_de_ventas(ventas_qs):
     """Pequeño reporte contable sobre un queryset de ``Venta``: total,
     cantidad y desglose por medio de pago. El desglose sale de
@@ -258,3 +348,99 @@ def ventas_por_cajero(ventas_qs):
         }
         for f in filas
     ]
+
+
+def ventas_por_dia(ventas_qs):
+    """Serie diaria de ventas dentro del rango de ``ventas_qs``. Las ventas
+    anuladas no cuentan."""
+    ventas_qs = ventas_qs.exclude(estado=Venta.Estado.ANULADA)
+    filas = (
+        ventas_qs.annotate(dia=TruncDate("creada_en"))
+        .values("dia")
+        .annotate(cantidad_ventas=Count("id"), total_vendido=Sum("total"))
+        .order_by("dia")
+    )
+    return [
+        {
+            "dia": f["dia"],
+            "cantidad_ventas": f["cantidad_ventas"],
+            "total_vendido": f["total_vendido"],
+        }
+        for f in filas
+    ]
+
+
+def reporte_iva(*, empresa, desde=None, hasta=None):
+    """Reporte de IVA del periodo: bruto (lo vendido), lo devuelto por notas
+    crédito y el neto — desglosado por tarifa (el %IVA que tenía cada línea
+    AL MOMENTO de venderse, no el actual del producto).
+
+    Las notas crédito se filtran por SU PROPIA fecha, no por la de la venta
+    original: una devolución de una venta de marzo hecha en abril baja el
+    IVA de abril, no reabre el reporte de marzo.
+
+    Nota: el desglose "por_tarifa" se recalcula línea a línea a partir de
+    cantidad/precio_unitario/porcentaje_iva (no hay base/iva guardados por
+    línea), así que puede diferir en centavos del ``total_iva`` ya
+    redondeado y guardado en cada ``Venta`` — diferencia de redondeo
+    normal e inevitable en un agregado, no un error de los totales.
+    """
+    ventas_qs = Venta.objects.filter(empresa=empresa).exclude(estado=Venta.Estado.ANULADA)
+    notas_qs = NotaCredito.objects.filter(empresa=empresa)
+    if desde:
+        ventas_qs = ventas_qs.filter(creada_en__date__gte=desde)
+        notas_qs = notas_qs.filter(creada_en__date__gte=desde)
+    if hasta:
+        ventas_qs = ventas_qs.filter(creada_en__date__lte=hasta)
+        notas_qs = notas_qs.filter(creada_en__date__lte=hasta)
+
+    decimal_field = DecimalField(max_digits=14, decimal_places=4)
+    total_linea_expr = ExpressionWrapper(
+        F("cantidad") * F("precio_unitario"), output_field=decimal_field
+    )
+    base_expr = ExpressionWrapper(
+        total_linea_expr / (Decimal("1") + F("porcentaje_iva") / Decimal("100")),
+        output_field=decimal_field,
+    )
+
+    por_tarifa = []
+    bruto_subtotal = Decimal("0")
+    bruto_total = Decimal("0")
+    filas = (
+        DetalleVenta.objects.filter(venta__in=ventas_qs)
+        .values("porcentaje_iva")
+        .annotate(base=Sum(base_expr), total=Sum(total_linea_expr))
+        .order_by("porcentaje_iva")
+    )
+    for f in filas:
+        base = (f["base"] or Decimal("0")).quantize(DOS_DECIMALES, rounding=ROUND_HALF_UP)
+        total_tarifa = (f["total"] or Decimal("0")).quantize(DOS_DECIMALES, rounding=ROUND_HALF_UP)
+        por_tarifa.append(
+            {
+                "porcentaje_iva": f["porcentaje_iva"],
+                "base": base,
+                "iva": total_tarifa - base,
+                "total": total_tarifa,
+            }
+        )
+        bruto_subtotal += base
+        bruto_total += total_tarifa
+
+    nc = notas_qs.aggregate(
+        subtotal=Sum("subtotal"), total_iva=Sum("total_iva"), total=Sum("total")
+    )
+    nc_subtotal = nc["subtotal"] or Decimal("0")
+    nc_iva = nc["total_iva"] or Decimal("0")
+    nc_total = nc["total"] or Decimal("0")
+
+    bruto_iva = bruto_total - bruto_subtotal
+    return {
+        "bruto": {"subtotal": bruto_subtotal, "total_iva": bruto_iva, "total": bruto_total},
+        "notas_credito": {"subtotal": nc_subtotal, "total_iva": nc_iva, "total": nc_total},
+        "neto": {
+            "subtotal": bruto_subtotal - nc_subtotal,
+            "total_iva": bruto_iva - nc_iva,
+            "total": bruto_total - nc_total,
+        },
+        "por_tarifa": por_tarifa,
+    }
